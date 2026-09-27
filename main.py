@@ -4,9 +4,10 @@ import mediapipe as mp
 import os
 import random
 from datetime import datetime
-
-
-
+import requests
+import qrcode
+import threading
+import webbrowser
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INTERFACES_DIR = os.path.join(BASE_DIR, "interfaces")
 CAPTURAS_DIR = os.path.join(BASE_DIR, "capturas")
@@ -16,13 +17,9 @@ LIBRE_IMG_PATH = os.path.join(INTERFACES_DIR, "MODO LIBRE.png")
 MANUAL_IMG_PATH = os.path.join(INTERFACES_DIR, "MANUAL DE INSTRUCCIONES.png")
 MEMORIA_IMG_PATH = os.path.join(INTERFACES_DIR, "MODO MEMORIA.png")
 FIGURA_IMG_PATH = os.path.join(INTERFACES_DIR, "FIGURA.png")
-
-
 MANUAL_VISTO_PATH = os.path.join(BASE_DIR, "manual_visto.txt")
 
 WINDOW_NAME = "Air Draw"
-
-
 CAM_X = 106
 CAM_Y = 180
 CAM_W = 1743
@@ -195,6 +192,14 @@ HOVER_FRAMES_PARA_ABRIR = 18  # cuadros sosteniendo el dedo sobre el icono
 # mensaje temporal (ej: "Dibujo guardado") con su tiempo de expiracion
 mensaje_temporal = ""
 mensaje_hasta = 0
+mostrando_guardado = False
+mostrando_qr = False
+qr_imagen = None
+qr_url = ""
+ultima_foto = None
+lienzo_guardado = None
+foto_guardada = None
+qr_mensaje = ""
 
 
 def distancia(p1, p2):
@@ -247,16 +252,177 @@ def mostrar_informacion(frame):
 
 
 def guardar_dibujo():
-    """Guarda el canvas (solo el dibujo, sin la camara) como PNG."""
     global mensaje_temporal, mensaje_hasta
+    global mostrando_guardado, lienzo_guardado, foto_guardada
 
     os.makedirs(CAPTURAS_DIR, exist_ok=True)
-    nombre = "dibujo_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".png"
-    ruta = os.path.join(CAPTURAS_DIR, nombre)
-    cv2.imwrite(ruta, canvas)
+    marca = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    mensaje_temporal = "Dibujo guardado: " + nombre
+    nombre_lienzo = "lienzo_" + marca + ".png"
+    ruta_lienzo = os.path.join(CAPTURAS_DIR, nombre_lienzo)
+    lienzo_guardado = canvas.copy()
+    cv2.imwrite(ruta_lienzo, lienzo_guardado)
+
+    if ultima_foto is not None:
+        nombre_foto = "foto_" + marca + ".jpg"
+        ruta_foto = os.path.join(CAPTURAS_DIR, nombre_foto)
+        foto_guardada = ultima_foto.copy()
+        cv2.imwrite(ruta_foto, foto_guardada)
+    else:
+        foto_guardada = None
+
+    mensaje_temporal = "Guardado: lienzo y foto"
     mensaje_hasta = cv2.getTickCount() + int(2.5 * cv2.getTickFrequency())
+    mostrando_guardado = True
+    return ruta_lienzo
+
+
+def subir_imagen_y_generar_qr(imagen, tipo):
+    global qr_imagen, qr_url, qr_mensaje, mostrando_qr
+
+    if imagen is None:
+        qr_mensaje = "No hay imagen disponible"
+        mostrando_qr = True
+        return
+
+    os.makedirs(CAPTURAS_DIR, exist_ok=True)
+    marca = datetime.now().strftime("%Y%m%d_%H%M%S")
+    extension = ".jpg" if tipo == "foto" else ".png"
+    nombre = tipo + "_qr_" + marca + extension
+    ruta = os.path.join(CAPTURAS_DIR, nombre)
+
+    if tipo == "foto":
+        cv2.imwrite(ruta, imagen, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        mime = "image/jpeg"
+    else:
+        cv2.imwrite(ruta, imagen)
+        mime = "image/png"
+
+    try:
+        with open(ruta, "rb") as archivo:
+            respuesta = requests.post(
+                "https://tempfile.org/api/upload/local",
+                files={"files": (nombre, archivo, mime)},
+                data={"expiryHours": "24"},
+                timeout=60
+            )
+
+        if respuesta.status_code != 200:
+            raise Exception(f"Error HTTP {respuesta.status_code}")
+
+        datos = respuesta.json()
+
+        if not datos.get("success"):
+            raise Exception(datos.get("error", "No se pudo subir la imagen"))
+
+        archivos = datos.get("files", [])
+        if not archivos:
+            raise Exception("TempFile no devolvio el archivo subido")
+
+        archivo_temp = archivos[0]
+        file_id = archivo_temp.get("id", "")
+        pagina_url = archivo_temp.get("url", "")
+
+        if file_id:
+            url_publica = f"https://tempfile.org/{file_id}/download"
+        elif pagina_url:
+            url_publica = pagina_url
+        else:
+            raise Exception("No se recibio un enlace de descarga")
+
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=12,
+            border=4
+        )
+        qr.add_data(url_publica)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+        qr_imagen = cv2.cvtColor(np.array(qr_img), cv2.COLOR_RGB2BGR)
+        qr_url = url_publica
+        qr_mensaje = "Escanea el QR para descargar la imagen"
+        mostrando_qr = True
+
+    except requests.exceptions.RequestException as e:
+        qr_mensaje = "Error de conexion con TempFile"
+        qr_url = ""
+        qr_imagen = None
+        mostrando_qr = True
+        print("Error TempFile:", e)
+    except Exception as e:
+        qr_mensaje = "Error al subir: " + str(e)
+        qr_url = ""
+        qr_imagen = None
+        mostrando_qr = True
+        print("Error TempFile:", e)
+
+def dibujar_popup_guardado(frame_base):
+    overlay = frame_base.copy()
+    oscuro = np.zeros_like(overlay)
+    cv2.addWeighted(oscuro, 0.65, overlay, 0.35, 0, overlay)
+
+    popup_w = 850
+    popup_h = 500
+    x0 = (ANCHO - popup_w) // 2
+    y0 = (ALTO - popup_h) // 2
+
+    cv2.rectangle(overlay, (x0, y0), (x0 + popup_w, y0 + popup_h), (255, 255, 255), -1)
+    cv2.rectangle(overlay, (x0, y0), (x0 + popup_w, y0 + popup_h), (0, 0, 0), 4)
+
+    cv2.putText(overlay, "DIBUJO GUARDADO", (x0 + 185, y0 + 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(overlay, "QUE QUIERES COMPARTIR?", (x0 + 190, y0 + 135),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+
+    bx1, by = x0 + 100, y0 + 190
+    bx2 = x0 + 470
+    bw, bh = 270, 120
+
+    cv2.rectangle(overlay, (bx1, by), (bx1 + bw, by + bh), (40, 40, 40), -1)
+    cv2.rectangle(overlay, (bx2, by), (bx2 + bw, by + bh), (40, 40, 40), -1)
+
+    cv2.putText(overlay, "LIENZO", (bx1 + 65, by + 72),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
+    cv2.putText(overlay, "FOTO", (bx2 + 90, by + 72),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
+
+    cv2.putText(overlay, "L = Lienzo    F = Foto    ESC = Cerrar",
+                (x0 + 150, y0 + 390), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 0, 0), 2, cv2.LINE_AA)
+
+    return overlay
+
+
+def dibujar_popup_qr(frame_base):
+    overlay = frame_base.copy()
+    oscuro = np.zeros_like(overlay)
+    cv2.addWeighted(oscuro, 0.70, overlay, 0.30, 0, overlay)
+
+    popup_w = 900
+    popup_h = 850
+    x0 = (ANCHO - popup_w) // 2
+    y0 = (ALTO - popup_h) // 2
+
+    cv2.rectangle(overlay, (x0, y0), (x0 + popup_w, y0 + popup_h), (255, 255, 255), -1)
+    cv2.rectangle(overlay, (x0, y0), (x0 + popup_w, y0 + popup_h), (0, 0, 0), 4)
+
+    cv2.putText(overlay, "ESCANEA EL QR", (x0 + 270, y0 + 65),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3, cv2.LINE_AA)
+
+    if qr_imagen is not None:
+        max_qr = 650
+        qr = cv2.resize(qr_imagen, (max_qr, max_qr), interpolation=cv2.INTER_NEAREST)
+        qx = x0 + (popup_w - max_qr) // 2
+        qy = y0 + 95
+        overlay[qy:qy + max_qr, qx:qx + max_qr] = qr
+
+    cv2.putText(overlay, qr_mensaje, (x0 + 205, y0 + 785),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(overlay, "ESC = cerrar", (x0 + 365, y0 + 820),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
+
+    return overlay
 
 
 def calcular_similitud():
@@ -550,6 +716,7 @@ def procesar_camara(imagen_fondo, permitir_dibujo=True):
     global prev_point, ultimo_gesto, borrador_activo
     global cursor_global, hover_frames, mostrando_manual
     global boton_hover_actual, boton_hover_frames
+    global ultima_foto
 
     salida = imagen_fondo.copy()
 
@@ -560,6 +727,7 @@ def procesar_camara(imagen_fondo, permitir_dibujo=True):
 
     frame = cv2.flip(frame, 1)
     frame = cv2.resize(frame, (CAM_W, CAM_H))
+    ultima_foto = frame.copy()
 
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     resultado = hands.process(frame_rgb)
@@ -770,6 +938,12 @@ while True:
             permitir_dibujo=not mostrando_manual and not mostrando_analisis
         )
 
+    if mostrando_guardado:
+        frame_mostrar = dibujar_popup_guardado(frame_mostrar)
+
+    if mostrando_qr:
+        frame_mostrar = dibujar_popup_qr(frame_mostrar)
+
     if mostrando_manual:
         frame_mostrar = dibujar_popup_manual(frame_mostrar)
 
@@ -783,6 +957,24 @@ while True:
     # con una tecla), getWindowProperty devuelve < 1 -> salimos
     if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
         break
+
+    if mostrando_qr:
+        if key == 27:
+            mostrando_qr = False
+            qr_imagen = None
+            qr_url = ""
+        continue
+
+    if mostrando_guardado:
+        if key in (ord('l'), ord('L')):
+            mostrando_guardado = False
+            subir_imagen_y_generar_qr(lienzo_guardado, "lienzo")
+        elif key in (ord('f'), ord('F')):
+            mostrando_guardado = False
+            subir_imagen_y_generar_qr(foto_guardada, "foto")
+        elif key == 27:
+            mostrando_guardado = False
+        continue
 
     if key == ord('q') or key == 27:
         break

@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import os
+import random
 from datetime import datetime
 
 
@@ -13,6 +14,11 @@ CAPTURAS_DIR = os.path.join(BASE_DIR, "capturas")
 MENU_IMG_PATH = os.path.join(INTERFACES_DIR, "MENU.png")
 LIBRE_IMG_PATH = os.path.join(INTERFACES_DIR, "MODO LIBRE.png")
 MANUAL_IMG_PATH = os.path.join(INTERFACES_DIR, "MANUAL DE INSTRUCCIONES.png")
+MEMORIA_IMG_PATH = os.path.join(INTERFACES_DIR, "MODO MEMORIA.png")
+FIGURA_IMG_PATH = os.path.join(INTERFACES_DIR, "FIGURA.png")
+
+
+MANUAL_VISTO_PATH = os.path.join(BASE_DIR, "manual_visto.txt")
 
 WINDOW_NAME = "Air Draw"
 
@@ -28,6 +34,13 @@ HELP_ICON_Y = 21
 HELP_ICON_W = 172
 HELP_ICON_H = 139
 
+# Recuadro donde va la figura a memorizar, dentro de FIGURA.png
+FIG_X = 516
+FIG_Y = 277
+FIG_W = 888
+FIG_H = 674
+
+TIEMPO_FIGURA_SEGUNDOS = 3
 
 
 DRAW_THICKNESS = 10
@@ -51,7 +64,6 @@ NOMBRES_COLORES = [
 
 color_actual = 0
 DRAW_COLOR = COLORES[color_actual]
-
 
 TOOLBAR_X = CAM_W - 170   # esquina superior derecha del recuadro
 TOOLBAR_Y = 20
@@ -107,9 +119,7 @@ def _rect_a_global(rect):
     return (x + CAM_X, y + CAM_Y, w, h)
 
 
-# cada boton guarda tambien su posicion global, para poder usar
-# el MISMO cursor (el que llega hasta el icono de ayuda) tanto
-# afuera como adentro del recuadro de camara
+
 for _boton in BOTONES:
     _boton["rect_global"] = _rect_a_global(_boton["rect"])
 
@@ -121,12 +131,21 @@ UMBRAL_ACCION = 20    # cuadros para borrador/vaciar/guardar (mas lento)
 boton_hover_actual = -1
 boton_hover_frames = 0
 
+
 STATE_MENU = "menu"
 STATE_LIBRE = "libre"
+STATE_MEMORIA_FIGURA = "memoria_figura"   # se muestra la figura a memorizar
+STATE_MEMORIA_DIBUJO = "memoria_dibujo"   # camara, para dibujarla de memoria
 
-# el manual ya NO es un estado que reemplaza la pantalla,
-# ahora es un popup que se dibuja ENCIMA del estado actual
+
 mostrando_manual = False
+
+# popup de analisis (solo en Modo Memoria, al presionar Enter)
+mostrando_analisis = False
+analisis_porcentaje = 0
+
+
+manual_visto = os.path.exists(MANUAL_VISTO_PATH)
 
 
 def cargar_imagen(path):
@@ -139,10 +158,18 @@ def cargar_imagen(path):
 menu_img = cargar_imagen(MENU_IMG_PATH)
 libre_img_base = cargar_imagen(LIBRE_IMG_PATH)
 manual_img = cargar_imagen(MANUAL_IMG_PATH)
+memoria_img_base = cargar_imagen(MEMORIA_IMG_PATH)
+figura_img_base = cargar_imagen(FIGURA_IMG_PATH)
 
 ALTO, ANCHO = libre_img_base.shape[:2]
 
 canvas = np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8)
+
+# figura actual a memorizar (se elige al entrar a Modo Memoria)
+figura_actual_nombre = None
+figura_actual_img = None
+figura_hasta = 0  # tick de reloj hasta el cual se muestra la figura
+
 
 
 mp_hands = mp.solutions.hands
@@ -160,8 +187,7 @@ prev_point = None
 ultimo_gesto = 0
 borrador_activo = False
 
-# cursor gestual: posicion del dedo indice mapeada a TODA la pantalla
-# (no solo al recuadro de camara), para poder "tocar" el icono de ayuda
+
 cursor_global = None
 hover_frames = 0
 HOVER_FRAMES_PARA_ABRIR = 18  # cuadros sosteniendo el dedo sobre el icono
@@ -233,10 +259,192 @@ def guardar_dibujo():
     mensaje_hasta = cv2.getTickCount() + int(2.5 * cv2.getTickFrequency())
 
 
+def calcular_similitud():
+    """Compara la silueta de lo dibujado (canvas) contra la
+    silueta de la figura original, y devuelve un porcentaje de
+    parecido (0-100). Se dilatan ambas mascaras un poco para
+    tolerar que el trazo a mano no caiga pixel-perfecto sobre
+    la linea original."""
+    kernel = np.ones((25, 25), np.uint8)
+
+    gris_dibujo = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+    _, mask_dibujo = cv2.threshold(gris_dibujo, 10, 255, cv2.THRESH_BINARY)
+    mask_dibujo = cv2.dilate(mask_dibujo, kernel)
+
+    figura_redim = cv2.resize(figura_actual_img, (CAM_W, CAM_H))
+    gris_figura = cv2.cvtColor(figura_redim, cv2.COLOR_BGR2GRAY)
+    _, mask_figura = cv2.threshold(gris_figura, 10, 255, cv2.THRESH_BINARY)
+    mask_figura = cv2.dilate(mask_figura, kernel)
+
+    interseccion = cv2.countNonZero(cv2.bitwise_and(mask_dibujo, mask_figura))
+    union = cv2.countNonZero(cv2.bitwise_or(mask_dibujo, mask_figura))
+
+    if union == 0:
+        return 0
+    return int((interseccion / union) * 100)
+
+
+def dibujar_popup_analisis(frame_base, porcentaje):
+    """Ventana emergente con el resultado del analisis."""
+    overlay = frame_base.copy()
+
+    fondo_oscuro = np.zeros_like(overlay)
+    cv2.addWeighted(fondo_oscuro, 0.6, overlay, 0.4, 0, overlay)
+
+    popup_w = int(ANCHO * 0.45)
+    popup_h = int(ALTO * 0.38)
+    x0 = (ANCHO - popup_w) // 2
+    y0 = (ALTO - popup_h) // 2
+
+    cv2.rectangle(overlay, (x0, y0), (x0 + popup_w, y0 + popup_h), (255, 255, 255), -1)
+    cv2.rectangle(overlay, (x0, y0), (x0 + popup_w, y0 + popup_h), (0, 0, 0), 4)
+
+    cv2.putText(
+        overlay, "Parecido:", (x0 + 40, y0 + 90),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 3, cv2.LINE_AA
+    )
+    cv2.putText(
+        overlay, f"{porcentaje}%", (x0 + 40, y0 + 190),
+        cv2.FONT_HERSHEY_SIMPLEX, 2.2, (0, 150, 0), 5, cv2.LINE_AA
+    )
+
+    cv2.putText(
+        overlay, "R = volver al menu", (x0 + 40, y0 + popup_h - 90),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA
+    )
+    cv2.putText(
+        overlay, "ESPACIO = seguir dibujando", (x0 + 40, y0 + popup_h - 40),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA
+    )
+
+    return overlay
+
+
 def punto_en_rect(punto, rect):
     x, y = punto
     rx, ry, rw, rh = rect
     return rx <= x <= rx + rw and ry <= y <= ry + rh
+
+
+
+def _fig_circulo(img, w, h):
+    cv2.circle(img, (w // 2, h // 2), min(w, h) // 3, (255, 255, 255), 10, cv2.LINE_AA)
+
+
+def _fig_cuadrado(img, w, h):
+    m = min(w, h) // 3
+    cv2.rectangle(img, (w // 2 - m, h // 2 - m), (w // 2 + m, h // 2 + m), (255, 255, 255), 10, cv2.LINE_AA)
+
+
+def _fig_triangulo(img, w, h):
+    m = min(w, h) // 3
+    pts = np.array([[w // 2, h // 2 - m], [w // 2 - m, h // 2 + m], [w // 2 + m, h // 2 + m]], np.int32)
+    cv2.polylines(img, [pts], True, (255, 255, 255), 10, cv2.LINE_AA)
+
+
+def _fig_estrella(img, w, h):
+    cx, cy = w // 2, h // 2
+    r_ext = min(w, h) // 3
+    r_int = r_ext // 2
+    pts = []
+    for i in range(10):
+        ang = -90 + i * 36
+        r = r_ext if i % 2 == 0 else r_int
+        x = int(cx + r * np.cos(np.radians(ang)))
+        y = int(cy + r * np.sin(np.radians(ang)))
+        pts.append([x, y])
+    cv2.polylines(img, [np.array(pts, np.int32)], True, (255, 255, 255), 10, cv2.LINE_AA)
+
+
+def _fig_corazon(img, w, h):
+    cx, cy = w // 2, h // 2
+    escala = min(w, h) / 300
+    pts = []
+    for t in range(0, 360, 5):
+        rad = np.radians(t)
+        x = 16 * np.sin(rad) ** 3
+        y = -(13 * np.cos(rad) - 5 * np.cos(2 * rad) - 2 * np.cos(3 * rad) - np.cos(4 * rad))
+        pts.append([int(cx + x * 10 * escala), int(cy + y * 10 * escala)])
+    cv2.polylines(img, [np.array(pts, np.int32)], True, (255, 255, 255), 10, cv2.LINE_AA)
+
+
+def _fig_casa(img, w, h):
+    cx, cy = w // 2, h // 2
+    m = min(w, h) // 4
+    cv2.rectangle(img, (cx - m, cy), (cx + m, cy + m), (255, 255, 255), 10, cv2.LINE_AA)
+    pts = np.array([[cx - m - 20, cy], [cx, cy - m], [cx + m + 20, cy]], np.int32)
+    cv2.polylines(img, [pts], True, (255, 255, 255), 10, cv2.LINE_AA)
+    cv2.rectangle(img, (cx - 30, cy + m // 2), (cx + 30, cy + m), (255, 255, 255), 8, cv2.LINE_AA)
+
+
+def _fig_sol(img, w, h):
+    cx, cy = w // 2, h // 2
+    r = min(w, h) // 5
+    cv2.circle(img, (cx, cy), r, (255, 255, 255), 10, cv2.LINE_AA)
+    for i in range(8):
+        ang = np.radians(i * 45)
+        x1 = int(cx + (r + 20) * np.cos(ang))
+        y1 = int(cy + (r + 20) * np.sin(ang))
+        x2 = int(cx + (r + 60) * np.cos(ang))
+        y2 = int(cy + (r + 60) * np.sin(ang))
+        cv2.line(img, (x1, y1), (x2, y2), (255, 255, 255), 8, cv2.LINE_AA)
+
+
+def _fig_arbol(img, w, h):
+    cx, cy = w // 2, h // 2
+    cv2.rectangle(img, (cx - 15, cy + 40), (cx + 15, cy + 160), (255, 255, 255), -1)
+    cv2.circle(img, (cx, cy - 40), 100, (255, 255, 255), 10, cv2.LINE_AA)
+
+
+def _fig_pez(img, w, h):
+    cx, cy = w // 2, h // 2
+    cv2.ellipse(img, (cx, cy), (110, 60), 0, 0, 360, (255, 255, 255), 10, cv2.LINE_AA)
+    pts = np.array([[cx + 100, cy], [cx + 170, cy - 55], [cx + 170, cy + 55]], np.int32)
+    cv2.polylines(img, [pts], True, (255, 255, 255), 10, cv2.LINE_AA)
+
+
+def _fig_carita(img, w, h):
+    cx, cy = w // 2, h // 2
+    r = min(w, h) // 3
+    cv2.circle(img, (cx, cy), r, (255, 255, 255), 10, cv2.LINE_AA)
+    cv2.circle(img, (cx - r // 3, cy - r // 4), 14, (255, 255, 255), -1)
+    cv2.circle(img, (cx + r // 3, cy - r // 4), 14, (255, 255, 255), -1)
+    cv2.ellipse(img, (cx, cy + r // 4), (r // 2, r // 3), 0, 0, 180, (255, 255, 255), 8, cv2.LINE_AA)
+
+
+FIGURAS = {
+    # geometricas
+    "circulo": _fig_circulo,
+    "cuadrado": _fig_cuadrado,
+    "triangulo": _fig_triangulo,
+    "estrella": _fig_estrella,
+    "corazon": _fig_corazon,
+    # trazo simple
+    "casa": _fig_casa,
+    "sol": _fig_sol,
+    "arbol": _fig_arbol,
+    "pez": _fig_pez,
+    "carita": _fig_carita,
+}
+
+
+def elegir_figura_nueva():
+    """Elige una figura al azar y la dibuja en un lienzo del
+    tamano exacto del recuadro de FIGURA.png. Devuelve el
+    nombre (por si se quiere mostrar/depurar) y la imagen."""
+    nombre = random.choice(list(FIGURAS.keys()))
+    lienzo = np.zeros((FIG_H, FIG_W, 3), dtype=np.uint8)
+    FIGURAS[nombre](lienzo, FIG_W, FIG_H)
+    return nombre, lienzo
+
+
+def procesar_pantalla_figura():
+    """Arma el frame de 'memoriza esta figura' y devuelve
+    tambien si ya se cumplio el tiempo para pasar a dibujar."""
+    salida = figura_img_base.copy()
+    salida[FIG_Y:FIG_Y + FIG_H, FIG_X:FIG_X + FIG_W] = figura_actual_img
+    tiempo_cumplido = cv2.getTickCount() >= figura_hasta
+    return salida, tiempo_cumplido
 
 
 def ejecutar_boton(boton):
@@ -333,8 +541,9 @@ def dibujar_toolbar(frame):
             cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 255), 1)
 
 
-def procesar_modo_libre(permitir_dibujo=True):
-    """Lee la camara y arma la interfaz de modo libre.
+def procesar_camara(imagen_fondo, permitir_dibujo=True):
+    """Lee la camara y arma la interfaz (Modo Libre o Modo
+    Memoria, segun 'imagen_fondo' que se le pase).
     Si permitir_dibujo=False, la camara se sigue viendo pero
     no se registran nuevos trazos (se usa mientras el manual
     esta abierto encima, para no dibujar 'a ciegas')."""
@@ -342,7 +551,7 @@ def procesar_modo_libre(permitir_dibujo=True):
     global cursor_global, hover_frames, mostrando_manual
     global boton_hover_actual, boton_hover_frames
 
-    salida = libre_img_base.copy()
+    salida = imagen_fondo.copy()
 
     ok, frame = cap.read()
     if not ok:
@@ -363,9 +572,7 @@ def procesar_modo_libre(permitir_dibujo=True):
         dedos_levantados = contar_dedos(lm)
         indice = (int(lm[8].x * CAM_W), int(lm[8].y * CAM_H))
 
-        # cursor gestual: mismo dedo indice, pero mapeado a la
-        # pantalla completa (1920x1080) para poder llegar al icono
-        # de ayuda aunque este fuera del recuadro de la camara
+        
         cursor_global = (int(lm[8].x * ANCHO), int(lm[8].y * ALTO))
 
         if click_en_icono_ayuda(*cursor_global):
@@ -382,9 +589,7 @@ def procesar_modo_libre(permitir_dibujo=True):
             ultimo_gesto = 0
 
         elif punto_en_rect(cursor_global, TOOLBAR_RECT_GLOBAL):
-            # el cursor (el MISMO que llega hasta el icono de ayuda)
-            # esta sobre la barra: se maneja el hover de botones y
-            # NO se dibuja en el lienzo
+            
             manejar_hover_botones(cursor_global)
             prev_point = None
             ultimo_gesto = 0
@@ -393,10 +598,7 @@ def procesar_modo_libre(permitir_dibujo=True):
             boton_hover_actual = -1
             boton_hover_frames = 0
 
-            # el dedo/mano ahora es SOLO para dibujar (1 dedo) o
-            # borrar (4 dedos) sobre el lienzo; seleccionar color,
-            # abrir el manual, guardar o vaciar se hace con el
-            # cursor sobre los botones/icono, no con gestos
+            
             if dedos_levantados == 4:
                 borrador_activo = True
                 prev_point = None
@@ -459,7 +661,7 @@ def procesar_modo_libre(permitir_dibujo=True):
 
     salida[CAM_Y:CAM_Y + CAM_H, CAM_X:CAM_X + CAM_W] = frame_final
 
-   
+    
     if cursor_global is not None:
         cv2.circle(salida, cursor_global, 14, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.circle(salida, cursor_global, 3, (255, 255, 255), cv2.FILLED, cv2.LINE_AA)
@@ -544,6 +746,7 @@ cv2.setMouseCallback(WINDOW_NAME, manejar_click)
 estado = STATE_MENU
 
 
+
 while True:
 
     if estado == STATE_MENU:
@@ -552,19 +755,65 @@ while True:
     elif estado == STATE_LIBRE:
         # si el manual esta abierto, la camara se sigue viendo
         # pero se desactiva el dibujo para no trazar "a ciegas"
-        frame_mostrar = procesar_modo_libre(permitir_dibujo=not mostrando_manual)
+        frame_mostrar = procesar_camara(libre_img_base, permitir_dibujo=not mostrando_manual)
+
+    elif estado == STATE_MEMORIA_FIGURA:
+        frame_mostrar, tiempo_cumplido = procesar_pantalla_figura()
+        if tiempo_cumplido and not mostrando_manual:
+            estado = STATE_MEMORIA_DIBUJO
+            canvas[:] = 0
+            prev_point = None
+
+    elif estado == STATE_MEMORIA_DIBUJO:
+        frame_mostrar = procesar_camara(
+            memoria_img_base,
+            permitir_dibujo=not mostrando_manual and not mostrando_analisis
+        )
 
     if mostrando_manual:
         frame_mostrar = dibujar_popup_manual(frame_mostrar)
 
+    if mostrando_analisis:
+        frame_mostrar = dibujar_popup_analisis(frame_mostrar, analisis_porcentaje)
+
     cv2.imshow(WINDOW_NAME, frame_mostrar)
     key = cv2.waitKey(1) & 0xFF
+
+    # si el usuario cerro la ventana con el boton X (en vez de
+    # con una tecla), getWindowProperty devuelve < 1 -> salimos
+    if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+        break
 
     if key == ord('q') or key == 27:
         break
 
+    elif mostrando_analisis:
+        # mientras el popup de analisis esta abierto, solo estas
+        # dos teclas hacen algo (el resto se ignora a proposito)
+        if key in (ord('r'), ord('R')):
+            mostrando_analisis = False
+            estado = STATE_MENU
+        elif key == 32:  # barra espaciadora
+            mostrando_analisis = False
+
     elif key == ord('1'):
         estado = STATE_LIBRE
+
+        if not manual_visto:
+            mostrando_manual = True
+            manual_visto = True
+            with open(MANUAL_VISTO_PATH, "w") as _f:
+                _f.write("visto")
+
+    elif key == ord('2'):
+        estado = STATE_MEMORIA_FIGURA
+        figura_actual_nombre, figura_actual_img = elegir_figura_nueva()
+        figura_hasta = cv2.getTickCount() + int(TIEMPO_FIGURA_SEGUNDOS * cv2.getTickFrequency())
+
+    elif key in (13, 10):  # ENTER
+        if estado == STATE_MEMORIA_DIBUJO and not mostrando_manual:
+            analisis_porcentaje = calcular_similitud()
+            mostrando_analisis = True
 
     elif key in (ord('m'), ord('M')):
         mostrando_manual = not mostrando_manual
@@ -574,11 +823,11 @@ while True:
             estado = STATE_MENU
 
     elif key in (ord('s'), ord('S')):
-        if estado == STATE_LIBRE and not mostrando_manual:
+        if estado in (STATE_LIBRE, STATE_MEMORIA_DIBUJO) and not mostrando_manual:
             guardar_dibujo()
 
     elif key in (ord('c'), ord('C')):
-        if not mostrando_manual:
+        if estado in (STATE_LIBRE, STATE_MEMORIA_DIBUJO) and not mostrando_manual:
             canvas[:] = 0
             prev_point = None
 
